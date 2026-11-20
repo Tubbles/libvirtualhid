@@ -309,9 +309,12 @@ USB parent; the public profile and native wired report framing stay unchanged.
 State report `0x42`
 carries ordinary controls, four rear buttons, digital trigger clicks,
 capacitive stick and grip touch, two pressure-sensitive trackpads and their
-clicks, motion, sequence, and sensor timestamp fields. The backend republishes
-the latest complete state every 4.032 milliseconds and serializes periodic and
-application submissions. Report `0x80` becomes ordinary two-channel rumble;
+clicks, motion, sequence, and sensor timestamp fields. The backend caches the
+latest complete state and streams it every 4.032 milliseconds. A `submit()` call
+writes no state report of its own, so a successful submission means the state
+was queued for the periodic stream. A changed `0x43` battery report is written
+immediately and an unchanged one at most once per second. Report `0x80` becomes
+ordinary two-channel rumble;
 reports `0x81` through `0x85` become targeted `haptics` callbacks while keeping
 their raw bytes available. The layouts and initialization behavior follow
 SDL's [Steam Controller report definitions](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/steam/controller_structs.h)

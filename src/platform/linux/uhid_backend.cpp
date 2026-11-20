@@ -115,6 +115,7 @@ namespace lvh::detail {
 #if defined(__linux__)
     namespace ps = playstation_feature_reports;
     constexpr auto playstation_periodic_report_ms = 10;
+    constexpr auto steam_controller_battery_report_refresh_interval = std::chrono::seconds {1};
     constexpr auto uhid_start_timeout = std::chrono::seconds {5};
 
     constexpr std::uint16_t xbox_bluetooth_version = 0x0513;
@@ -3133,6 +3134,9 @@ namespace lvh::detail {
         const std::vector<std::uint8_t> &report
       ) override {
         std::lock_guard lock {state_mutex_};
+        if (profile_.gamepad_kind == GamepadProfileKind::steam_triton) {
+          return queue_steam_controller_state(state);
+        }
         const auto transport_report = is_xbox_uhid_profile(profile_.gamepad_kind) ?
                                         xbox_bluetooth::make_xbox_bluetooth_input_report(
                                           state,
@@ -3143,14 +3147,6 @@ namespace lvh::detail {
         auto status = write_input_report(transport_report);
         if (status.ok() && supports_battery_ && state.battery && is_xbox_uhid_profile(profile_.gamepad_kind)) {
           status = write_input_report(make_xbox_bluetooth_battery_report(*state.battery));
-        }
-        if (
-          status.ok() && supports_battery_ && state.battery &&
-          profile_.gamepad_kind == GamepadProfileKind::steam_triton
-        ) {
-          if (const auto battery_report = reports::pack_battery_report(profile_, *state.battery); battery_report) {
-            status = write_input_report(*battery_report);
-          }
         }
         if (status.ok()) {
           last_state_ = state;
@@ -3209,6 +3205,42 @@ namespace lvh::detail {
       }
 
     private:
+      // The caller holds state_mutex_.
+      OperationStatus queue_steam_controller_state(const GamepadState &state) {
+        if (!open_) {
+          return OperationStatus::failure(ErrorCode::device_closed, "UHID gamepad is closed");
+        }
+
+        // The periodic stream matches the controller's native report cadence.
+        // An extra state report per submission can distort pad motion at
+        // touch release in downstream consumers such as Steam Input.
+        last_state_ = state;
+        if (!supports_battery_ || !state.battery) {
+          return OperationStatus::success();
+        }
+
+        const auto battery_report = reports::pack_battery_report(profile_, *state.battery);
+        if (!battery_report) {
+          return OperationStatus::success();
+        }
+
+        // Repeat an unchanged battery report only once per refresh interval
+        // instead of once per submission.
+        const auto now = std::chrono::steady_clock::now();
+        const auto battery_report_changed = *battery_report != last_battery_report_;
+        const auto battery_report_due = now - last_battery_report_time_ >= steam_controller_battery_report_refresh_interval;
+        if (!battery_report_changed && !battery_report_due) {
+          return OperationStatus::success();
+        }
+
+        const auto status = write_input_report(*battery_report);
+        if (status.ok()) {
+          last_battery_report_ = *battery_report;
+          last_battery_report_time_ = now;
+        }
+        return status;
+      }
+
       OperationStatus write_input_report(const std::vector<std::uint8_t> &report) {
         if (!open_) {
           return OperationStatus::failure(ErrorCode::device_closed, "UHID gamepad is closed");
@@ -3341,21 +3373,39 @@ namespace lvh::detail {
       }
 
       void periodic_report_loop(std::stop_token stop_token) {
-        const auto interval = profile_.gamepad_kind == GamepadProfileKind::steam_triton ?
+        const auto is_steam_controller = profile_.gamepad_kind == GamepadProfileKind::steam_triton;
+        const auto interval = is_steam_controller ?
                                 std::chrono::microseconds {steam_controller_protocol::input_interval_us} :
                                 std::chrono::duration_cast<std::chrono::microseconds>(
                                   std::chrono::milliseconds {playstation_periodic_report_ms}
                                 );
+        auto next_report = std::chrono::steady_clock::now() + interval;
         while (!stop_token.stop_requested() && running_) {
-          std::this_thread::sleep_for(interval);
+          // Steam Controller reports follow a fixed deadline so the stream
+          // keeps the native cadence instead of drifting by the write time.
+          if (is_steam_controller) {
+            std::this_thread::sleep_until(next_report);
+          } else {
+            std::this_thread::sleep_for(interval);
+          }
           if (stop_token.stop_requested() || !running_ || !open_) {
             break;
           }
 
-          std::lock_guard lock {state_mutex_};
-          const auto report = reports::pack_input_report(profile_, last_state_);
-          if (!report.empty()) {
-            static_cast<void>(write_input_report(report));
+          {
+            std::lock_guard lock {state_mutex_};
+            const auto report = reports::pack_input_report(profile_, last_state_);
+            if (!report.empty()) {
+              static_cast<void>(write_input_report(report));
+            }
+          }
+
+          if (is_steam_controller) {
+            next_report += interval;
+            const auto now = std::chrono::steady_clock::now();
+            if (next_report <= now) {
+              next_report = now + interval;
+            }
           }
         }
       }
@@ -3505,6 +3555,8 @@ namespace lvh::detail {
       std::array<std::uint8_t, 6> playstation_mac_address_ {};
       UhidSteamFeatureState steam_feature_;
       GamepadState last_state_;
+      std::vector<std::uint8_t> last_battery_report_;
+      std::chrono::steady_clock::time_point last_battery_report_time_ {};
       bool supports_battery_ = false;
       std::atomic_bool open_ = true;
       std::atomic_bool running_ = false;
